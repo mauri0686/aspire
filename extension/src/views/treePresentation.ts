@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { ResourceState, HealthStatus, StateStyle } from '../editor/resourceConstants';
+import { ResourceState, ResourceType, HealthStatus, StateStyle } from '../editor/resourceConstants';
 import { compareResourceCommands, getParameterValueDescription, getResourceStateDescription } from '../utils/resourceDisplay';
 import {
     tooltipType,
@@ -98,13 +98,35 @@ export function getParentResourceName(resource: ResourceJson): string | null {
 }
 
 export function getResourceSourcePath(resource: ResourceJson, appHostPath?: string): string | undefined {
+    const appHostDirectory = appHostPath ? path.dirname(appHostPath) : undefined;
+    const projectPath = resource.properties?.['project.path']?.trim();
+    const resourceType = resource.resourceType.toLowerCase();
+    // These producers use source for image/package identifiers, configuration keys, or hostnames.
+    // Tools also publish executable.path for their launcher, not for the tool's source.
+    const hasNonFilesystemSource = Boolean(resource.properties?.['container.image']?.trim() || resource.properties?.['tool.package']?.trim())
+        || resourceType === ResourceType.Parameter.toLowerCase()
+        || resourceType === ResourceType.ExternalService.toLowerCase();
+    const executablePath = hasNonFilesystemSource ? undefined : resource.properties?.['executable.path']?.trim();
+    const executableWorkDir = resource.properties?.['executable.workDir']?.trim();
+    const executableDirectory = executableWorkDir && path.isAbsolute(executableWorkDir)
+        ? executableWorkDir
+        : appHostDirectory
+            ? path.resolve(appHostDirectory, executableWorkDir || '.')
+            : undefined;
+
+    // For {"executable.path":"./run.cmd","executable.workDir":"/repo/worker"},
+    // the command is relative to the worker directory, not the AppHost.
     const sourceValues = [
-        resource.properties?.['project.path'],
-        resource.properties?.['executable.path'],
-        resource.properties?.['resource.source'],
-        resource.source,
+        { source: projectPath, directory: appHostDirectory },
+        {
+            source: executablePath && (path.isAbsolute(executablePath) || executablePath.includes(path.sep) || executablePath.includes('/'))
+                ? executablePath
+                : undefined,
+            directory: executableDirectory,
+        },
+        { source: hasNonFilesystemSource ? undefined : resource.properties?.['resource.source'], directory: appHostDirectory },
     ];
-    const candidates = sourceValues.flatMap(source => {
+    const candidates = sourceValues.flatMap(({ source, directory }) => {
         const trimmedSource = source?.trim();
         if (!trimmedSource) {
             return [];
@@ -112,8 +134,8 @@ export function getResourceSourcePath(resource: ResourceJson, appHostPath?: stri
 
         return path.isAbsolute(trimmedSource)
             ? [trimmedSource]
-            : appHostPath
-                ? [path.resolve(path.dirname(appHostPath), trimmedSource)]
+            : directory
+                ? [path.resolve(directory, trimmedSource)]
                 : [];
     });
 

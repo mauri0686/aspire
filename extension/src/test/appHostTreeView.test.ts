@@ -14,7 +14,7 @@ import { registerTreeViewCommands } from '../activation/registerTreeViewCommands
 import { AppHostDataRepository, shortenPath, shortenPaths } from '../data/AppHostDataRepository';
 import { AspireCliFailedError } from '../data/appHostCliContracts';
 import { AspireAppHostTreeProvider } from '../views/AspireAppHostTreeProvider';
-import { getResourceContextValue, getResourceIcon, getResourceCommandIcon, resolveAppHostSourcePath, buildResourceDescription } from '../views/treePresentation';
+import { getResourceContextValue, getResourceSourcePath, getResourceIcon, getResourceCommandIcon, resolveAppHostSourcePath, buildResourceDescription } from '../views/treePresentation';
 import { AppHostItem, ResourceItem, WorkspaceAppHostItem, WorkspaceResourcesItem } from '../views/treeItems';
 import type { Clipboard } from '../views/AspireAppHostTreeProvider';
 import type { AppHostDisplayInfo, ResourceJson, ViewMode } from '../data/AppHostDataRepository';
@@ -1766,19 +1766,220 @@ suite('resolveAppHostSourcePath', () => {
     });
 });
 
+suite('getResourceSourcePath', () => {
+    let directory: string;
+    let appHostPath: string;
+    let workerDirectory: string;
+    let sourcePath: string;
+    let resource: ResourceJson;
+
+    setup(() => {
+        directory = fs.mkdtempSync(path.join(os.tmpdir(), 'aspire-resource-source-'));
+        const appHostDirectory = path.join(directory, 'AppHost');
+        workerDirectory = path.join(directory, 'worker');
+        fs.mkdirSync(appHostDirectory);
+        fs.mkdirSync(workerDirectory);
+        appHostPath = path.join(appHostDirectory, 'AppHost.csproj');
+        sourcePath = path.join(workerDirectory, 'run.cmd');
+        fs.writeFileSync(sourcePath, '@echo worker');
+        fs.writeFileSync(path.join(appHostDirectory, 'run.cmd'), '@echo unrelated');
+        resource = makeResource({
+            resourceType: 'Executable',
+            source: 'run.cmd',
+            properties: {
+                'executable.path': './run.cmd',
+                'executable.workDir': workerDirectory,
+            },
+        });
+    });
+
+    teardown(() => {
+        removeDirectorySafely(directory);
+    });
+
+    test('relative executable resolves from its absolute working directory, not a colliding AppHost file', () => {
+        assert.strictEqual(getResourceSourcePath(resource, appHostPath), sourcePath);
+    });
+
+    test('relative working directory resolves from the owning AppHost', () => {
+        resource.properties!['executable.workDir'] = path.join('..', 'worker');
+        assert.strictEqual(getResourceSourcePath(resource, appHostPath), sourcePath);
+    });
+
+    test('absolute working directory does not require an AppHost path', () => {
+        assert.strictEqual(getResourceSourcePath(resource), sourcePath);
+    });
+
+    test('missing working directory preserves AppHost-relative compatibility', () => {
+        delete resource.properties!['executable.workDir'];
+        assert.strictEqual(getResourceSourcePath(resource, appHostPath), path.join(path.dirname(appHostPath), 'run.cmd'));
+    });
+
+    test('absolute executable path does not use the working directory', () => {
+        resource.properties!['executable.path'] = sourcePath;
+        resource.properties!['executable.workDir'] = path.dirname(appHostPath);
+        assert.strictEqual(getResourceSourcePath(resource, appHostPath), sourcePath);
+    });
+
+    test('missing executable does not fall back to a colliding display basename', () => {
+        fs.unlinkSync(sourcePath);
+        assert.strictEqual(getResourceSourcePath(resource, appHostPath), undefined);
+        assert.strictEqual(getResourceContextValue(resource, appHostPath), 'resource');
+    });
+
+    test('bare PATH command does not resolve to a same-named local file', () => {
+        resource.properties!['executable.path'] = 'run.cmd';
+        assert.strictEqual(getResourceSourcePath(resource, appHostPath), undefined);
+    });
+
+    const nonFilesystemSources: { name: string; resourceType: string; properties: Record<string, string> }[] = [
+        { name: 'container image', resourceType: 'Container', properties: { 'container.image': 'run.cmd' } },
+        { name: 'tool package', resourceType: 'Tool', properties: { 'tool.package': 'run.cmd', 'executable.path': 'dotnet' } },
+        { name: 'parameter configuration key', resourceType: 'Parameter', properties: {} },
+        { name: 'external service hostname', resourceType: 'ExternalService', properties: {} },
+    ];
+
+    for (const { name, resourceType, properties } of nonFilesystemSources) {
+        for (const kind of ['file', 'directory']) {
+            test(`non-filesystem ${name} does not navigate to a colliding ${kind}`, () => {
+                if (kind === 'directory') {
+                    const collisionPath = path.join(path.dirname(appHostPath), 'run.cmd');
+                    fs.unlinkSync(collisionPath);
+                    fs.mkdirSync(collisionPath);
+                }
+                const nonFilesystemResource = makeResource({
+                    resourceType,
+                    source: 'run.cmd',
+                    properties: { 'resource.source': 'run.cmd', ...properties },
+                });
+
+                assert.strictEqual(getResourceSourcePath(nonFilesystemResource, appHostPath), undefined);
+                assert.strictEqual(getResourceContextValue(nonFilesystemResource, appHostPath), 'resource');
+            });
+        }
+    }
+
+    test('tool launcher is not a filesystem source even when its absolute path exists', () => {
+        const toolResource = makeResource({
+            resourceType: 'Tool',
+            source: 'run.cmd',
+            properties: {
+                'tool.package': 'run.cmd',
+                'executable.path': sourcePath,
+                'resource.source': 'run.cmd',
+            },
+        });
+
+        assert.strictEqual(getResourceSourcePath(toolResource, appHostPath), undefined);
+    });
+
+    test('custom filesystem source directory does not require an AppHost path', () => {
+        const customResource = makeResource({
+            resourceType: 'Custom',
+            properties: { 'resource.source': workerDirectory },
+        });
+
+        assert.strictEqual(getResourceSourcePath(customResource), workerDirectory);
+        assert.strictEqual(getResourceContextValue(customResource), 'resource:canOpenSource');
+    });
+
+    test('Blazor WASM project source resolves from its owning AppHost', () => {
+        const projectFile = path.join(path.dirname(appHostPath), 'BlazorApp.csproj');
+        fs.writeFileSync(projectFile, '<Project />');
+        const blazorResource = makeResource({
+            resourceType: 'BlazorWasmApp',
+            source: 'BlazorApp.csproj',
+            properties: { 'resource.source': 'BlazorApp.csproj' },
+        });
+
+        assert.strictEqual(getResourceSourcePath(blazorResource, appHostPath), projectFile);
+    });
+
+    test('display source alone is not filesystem metadata even when the file exists', () => {
+        const displayResource = makeResource({ source: sourcePath });
+        assert.strictEqual(getResourceSourcePath(displayResource, appHostPath), undefined);
+        assert.strictEqual(getResourceContextValue(displayResource, appHostPath), 'resource');
+    });
+
+    for (const viewMode of ['workspace', 'global'] as const) {
+        test(`${viewMode} resource navigation rejects colliding non-filesystem sources`, async () => {
+            const sandbox = sinon.createSandbox();
+            const provider = makeTreeProvider([makeAppHost({
+                appHostPath,
+                resources: nonFilesystemSources.map(({ resourceType, properties }) => makeResource({
+                    name: resourceType,
+                    resourceType,
+                    source: 'run.cmd',
+                    properties: { 'resource.source': 'run.cmd', ...properties },
+                })),
+            })], viewMode);
+            try {
+                const executeCommand = sandbox.stub(vscode.commands, 'executeCommand').resolves();
+                const warning = sandbox.stub(vscode.window, 'showWarningMessage');
+                const [appHostItem] = provider.getChildren();
+                const resourcesGroup = appHostItem instanceof WorkspaceResourcesItem
+                    ? appHostItem
+                    : provider.getChildren(appHostItem).find(item => item.contextValue === 'resourcesGroup');
+                assert.ok(resourcesGroup);
+                const resourceItems = provider.getChildren(resourcesGroup);
+                assert.strictEqual(resourceItems.length, nonFilesystemSources.length);
+                for (const resourceItem of resourceItems) {
+                    assert.ok(resourceItem instanceof ResourceItem);
+                    assert.strictEqual(resourceItem.contextValue, 'resource');
+                    await provider.openResourceSource(resourceItem);
+                }
+
+                assert.strictEqual(executeCommand.called, false);
+                assert.strictEqual(warning.callCount, nonFilesystemSources.length);
+            } finally {
+                provider.dispose();
+                sandbox.restore();
+            }
+        });
+
+        test(`${viewMode} resource navigation reveals the executable in its owning working directory`, async () => {
+            const sandbox = sinon.createSandbox();
+            const provider = makeTreeProvider([makeAppHost({
+                appHostPath,
+                resources: [resource],
+            })], viewMode);
+            try {
+                const executeCommand = sandbox.stub(vscode.commands, 'executeCommand').resolves();
+                sandbox.stub(vscode.workspace, 'getWorkspaceFolder').returns(createWorkspaceFolder('worker', workerDirectory));
+                const [appHostItem] = provider.getChildren();
+                const resourcesGroup = appHostItem instanceof WorkspaceResourcesItem
+                    ? appHostItem
+                    : provider.getChildren(appHostItem).find(item => item.contextValue === 'resourcesGroup');
+                assert.ok(resourcesGroup);
+                const [resourceItem] = provider.getChildren(resourcesGroup);
+                assert.ok(resourceItem instanceof ResourceItem);
+                assert.strictEqual(resourceItem.appHostPath, appHostPath);
+                assert.strictEqual(resourceItem.contextValue, 'resource:canOpenSource');
+
+                await provider.openResourceSource(resourceItem);
+
+                assert.strictEqual(executeCommand.calledOnceWithExactly('revealInExplorer', vscode.Uri.file(sourcePath)), true);
+            } finally {
+                provider.dispose();
+                sandbox.restore();
+            }
+        });
+    }
+});
+
 suite('getResourceContextValue', () => {
     test('resource with no commands returns just "resource"', () => {
         assert.strictEqual(getResourceContextValue(makeResource()), 'resource');
     });
 
-    test('resource with an existing source path includes source context', () => {
-        const result = getResourceContextValue(makeResource({ source: __filename }));
+    test('resource with an existing filesystem source property includes source context', () => {
+        const result = getResourceContextValue(makeResource({ properties: { 'resource.source': __filename } }));
         assert.strictEqual(result, 'resource:canOpenSource');
     });
 
     test('relative resource source resolves from the AppHost directory', () => {
         const appHostPath = path.join(path.dirname(__filename), 'apphost.csproj');
-        const result = getResourceContextValue(makeResource({ source: path.basename(__filename) }), appHostPath);
+        const result = getResourceContextValue(makeResource({ properties: { 'resource.source': path.basename(__filename) } }), appHostPath);
         assert.strictEqual(result, 'resource:canOpenSource');
     });
 
@@ -1791,7 +1992,9 @@ suite('getResourceContextValue', () => {
     });
 
     test('resource with an unavailable source path does not include source context', () => {
-        const result = getResourceContextValue(makeResource({ source: path.join(os.tmpdir(), 'missing-resource-source') }));
+        const result = getResourceContextValue(makeResource({
+            properties: { 'resource.source': path.join(os.tmpdir(), 'missing-resource-source') },
+        }));
         assert.strictEqual(result, 'resource');
     });
 
@@ -1808,7 +2011,7 @@ suite('getResourceContextValue', () => {
             const sourcePath = __filename;
             const provider = makeTreeProvider([
                 makeAppHost({
-                    resources: [makeResource({ source: sourcePath })],
+                    resources: [makeResource({ properties: { 'resource.source': sourcePath } })],
                 }),
             ]);
             const executeCommand = sandbox.stub(vscode.commands, 'executeCommand').resolves();
@@ -1831,7 +2034,9 @@ suite('getResourceContextValue', () => {
             const sandbox = sinon.createSandbox();
             const provider = makeTreeProvider([
                 makeAppHost({
-                    resources: [makeResource({ source: path.join(os.tmpdir(), 'missing-resource-source') })],
+                    resources: [makeResource({
+                        properties: { 'resource.source': path.join(os.tmpdir(), 'missing-resource-source') },
+                    })],
                 }),
             ]);
             const executeCommand = sandbox.stub(vscode.commands, 'executeCommand').resolves();

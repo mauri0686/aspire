@@ -74,6 +74,40 @@ export async function observeVisibleSideBarSectionTitles(durationMs = 2000): Pro
     return [...observedTitles];
 }
 
+export async function waitForExplorerSelection(expectedPath: readonly string[], timeoutMs = 30000): Promise<void> {
+    let lastSelection: { focused: boolean; path: string[] } = { focused: false, path: [] };
+
+    try {
+        await VSBrowser.instance.driver.wait(async () => {
+            lastSelection = await VSBrowser.instance.driver.executeScript<{ focused: boolean; path: string[] }>(`
+                const explorer = document.querySelector('.explorer-folders');
+                const selectedRow = explorer?.querySelector('.monaco-list-row[aria-selected="true"]');
+                const labels = [];
+                let level = Infinity;
+                // Explorer's flat tree rows use aria-level to identify the selected file's parents.
+                for (let row = selectedRow; row; row = row.previousElementSibling) {
+                    const rowLevel = Number(row.getAttribute('aria-level'));
+                    if (rowLevel > 0 && rowLevel < level) {
+                        const label = row.querySelector('.label-name')?.textContent?.trim();
+                        if (label) {
+                            labels.unshift(label);
+                        }
+                        level = rowLevel;
+                    }
+                }
+                return { focused: Boolean(explorer?.contains(document.activeElement)), path: labels };
+            `);
+            const selectedPath = lastSelection.path.slice(-expectedPath.length);
+            return lastSelection.focused
+                && selectedPath.length === expectedPath.length
+                && selectedPath.every((label, index) => label === expectedPath[index]);
+        }, timeoutMs, `Timed out waiting for Explorer to focus and select '${expectedPath.join('/')}'.`);
+    }
+    catch (error) {
+        throw withWaitDiagnostics(error, [`Last Explorer selection: ${JSON.stringify(lastSelection)}`]);
+    }
+}
+
 export async function waitForTreeItem(section: TreeSection, label: string, timeoutMs = 30000): Promise<TreeItem> {
     return await VSBrowser.instance.driver.wait(async () => {
         try {
