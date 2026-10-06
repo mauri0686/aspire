@@ -62,7 +62,7 @@ Run `build.ps1` (Windows) or `build.sh` (Mac/Linux) from the repository root to 
 To debug the Aspire CLI together with the extension, set `Aspire Cli Executable Path` to the CLI output path. You can use an absolute path or a workspace token. If you opened the `extension` folder, the local build is:
 
 ```json
-"aspire.aspireCliExecutablePath": "${workspaceFolder}/../artifacts/bin/Aspire.Cli/Debug/net10.0/aspire"
+"aspire.aspireCliExecutablePath": "${workspaceFolder}/../artifacts/bin/Aspire.Cli/Debug/net11.0/aspire"
 ```
 
 `${workspaceFolder}` uses the folder that owns the current operation. In a multi-root workspace, `${workspaceFolder:name}` selects the uniquely named folder. Plain relative paths are not resolved; use a workspace token when the path should move with the checkout.
@@ -77,7 +77,7 @@ You can use the `Aspire: Extension settings` command to open VS Code settings di
 
 When `Aspire Cli Executable Path` resolves to an existing **absolute** path that is not a raw framework-dependent local CLI build output, the extension forwards that value as the `AspireCliPath` MSBuild property/environment variable to terminals, tasks, and debug processes in that workspace folder. The Aspire SDK's `ResolveAspireCliBundle` task uses `AspireCliPath` (defined in [`src/Aspire.Hosting.Tasks/ResolveAspireCliBundle.cs`](/src/Aspire.Hosting.Tasks/ResolveAspireCliBundle.cs)) to locate the matching bundle layout — DCP, dashboard, and terminal-host binaries — and bakes those paths into the built AppHost as `[AssemblyMetadata]` attributes. Without this forwarding, MSBuild probes `PATH` and can stamp the *stable* CLI's bundle into the AppHost while the extension is launching it through the *dev* CLI, producing surprising runtime mismatches such as `<unresolved-aspire-terminalhost>` even though the new CLI is correctly invoked (tracked in [issue #18073](https://github.com/microsoft/aspire/issues/18073)).
 
-A tokenized setting is expanded to an absolute path before validation. A plain relative value (for example the bare `aspire` literal) or an absolute path that no longer exists is intentionally not forwarded because `ResolveAspireCliBundle` stops with a warning for invalid explicit `AspireCliPath` values instead of probing `PATH`. A raw framework-dependent local build output such as `artifacts/bin/Aspire.Cli/Debug/net10.0/aspire` is also not forwarded because it can make `ResolveAspireCliBundle` fall back to unrelated `ASPIRE_HOME` metadata. Symlinks to that raw local build output are filtered the same way. To dogfood bundle metadata end-to-end, point the setting at an installed/bundled CLI layout with a sidecar or adjacent bundle assets. Clear the setting to revert to default PATH/ASPIRE_HOME resolution.
+A tokenized setting is expanded to an absolute path before validation. A plain relative value (for example the bare `aspire` literal) or an absolute path that no longer exists is intentionally not forwarded because `ResolveAspireCliBundle` stops with a warning for invalid explicit `AspireCliPath` values instead of probing `PATH`. A raw framework-dependent local build output such as `artifacts/bin/Aspire.Cli/Debug/net11.0/aspire` is also not forwarded because it can make `ResolveAspireCliBundle` fall back to unrelated `ASPIRE_HOME` metadata. Symlinks to that raw local build output are filtered the same way. To dogfood bundle metadata end-to-end, point the setting at an installed/bundled CLI layout with a sidecar or adjacent bundle assets. Clear the setting to revert to default PATH/ASPIRE_HOME resolution.
 
 ## Running tests
 
@@ -99,9 +99,23 @@ corepack yarn unit-test --grep "parseConfigInfoOutput"
 corepack yarn unit-test --run out/test/configInfoProvider.test.js --run out/test/extensionApi.test.js
 ```
 
+Editor-assistance regressions live in `editorAssistanceTools.test.ts`; shared ordinal name matching is covered by `strings.test.ts` and `launchProfiles.test.ts`. Model-facing resource sources must reject the same unsafe Unicode categories as metadata, including leading and trailing controls before trimming container images. Keep their separate length limits: 256 Unicode scalar values for sources and 128 UTF-16 code units for metadata. `dotnetDebugger.test.ts` covers both emitted process errors and synchronous Node argument-validation errors.
+
+Multi-root lifecycle tests must round-trip returned `appHostPath` selectors through subsequent operations. MCP registration tests must cover ownership changes between nested workspace folders while preserving labels and definitions for unaffected pins.
+
+Start/stop confirmations expire against monotonic time. Expiry regressions must vary wall time independently, checking just before and exactly at the deadline for both tools.
+
+The launch-failure store retains one sanitized failure per AppHost for 30 minutes using monotonic time, with a global limit of 50 AppHosts. A replacement refreshes expiry and write-order eviction; reads do not. Cover reads and writes, including the production singleton, when testing clock changes. Verify duplicate-capture suppression by counting writes, not retained entries. CLI filesystem normalization coverage must include caseless Unicode names such as Hangul, not only names with upper/lowercase variants.
+
+The store is a fallback for failures that can outlive a debug session or happen before one exists, not a second logging system. It keeps only the six bounded failure fields; detailed errors remain in the existing Output, CLI, and resource logs.
+
+The CLI's shared resource-wait budget is covered by `ResourceWaitServiceTests` and `WaitForResourcesToolTests` under `tests/Aspire.Cli.Tests/`. Clock-jump regressions must vary UTC independently of monotonic elapsed time; advancing both clocks together does not test this failure.
+
 ### End-to-end tests
 
 UI end-to-end tests live under `src/test-e2e`. They run a packaged VSIX in a real VS Code instance through ExTester, using a real Aspire CLI and a generated AppHost workspace.
+
+For read-only AppHosts tree assertions, use `waitForAppHostsTreePath` with exact labels (for example, `[appHostLabel, 'Run AppHost']`). It captures visible labels and parent/child relationships together; a `TreeItem` returned by a lookup can refer to a recycled row by the time a later `getLabel()` or child lookup runs. Repository readiness alone does not prevent this UI race. Keep handle-returning helpers for interactions, and do not wait for discovery completion when asserting streamed candidates.
 
 Run one fixture-compatible E2E group from `extension/`. The default all-spec glob now spans the core C# suite, Java playground suites, and the Java starter suite, which require different workspaces and must run separately. Use one of the existing subset examples below.
 
@@ -142,7 +156,11 @@ ASPIRE_EXTENSION_E2E_CSHARP_VSIX="$CSHARP_VSIX" \
 corepack yarn test:e2e
 ```
 
-Linux exercises Chrome, while Windows exercises Edge. The shard generates standalone, hosted-global, and hosted-per-page .NET 10 fixtures. Both VSIX files must match the current platform, and C# must be 2.145.15-prerelease or newer.
+Linux exercises Chrome, while Windows exercises Edge. The shard generates standalone, hosted-global, and hosted-per-page `net11.0` fixtures. Both VSIX files must match the current platform, and C# must be 2.145.15-prerelease or newer.
+
+Before starting the AppHost, the shard awaits C# activation, which installs its runtime dependencies, and checks that `VSWebAssemblyBridge` is present. It does not wait for language-server project import to check this runtime component. If the component is missing, setup reloads the isolated extension host to let C# reacquire and validate it, with at most three activation attempts. Other activation errors fail immediately, and a component that remains missing fails setup explicitly instead of falling back to the legacy proxy. The managed-breakpoint scenarios themselves are never retried.
+
+Each managed proof uses a separate browser profile under the test run's temporary root. A browser lock left by another scenario therefore cannot block its launch. Profiles are removed by the runner after VS Code exits and are not included in uploaded diagnostics; the breakpoint, debug-session shutdown, and command-reset assertions still have to pass.
 
 The Windows shard launches VS Code with `__COMPAT_LAYER=DetectorsAppHealth` to cover [Edge's compatibility-layer relaunch](https://github.com/microsoft/aspire/issues/20151). The extension explicitly unsets this variable only in Edge's browser-launch environment so js-debug can track the original browser process through managed breakpoint discovery.
 
@@ -168,6 +186,8 @@ Each source and file is attempted independently, and text is redacted before bei
 Linux CI shards also record the Xvfb display with `ffmpeg`. The default workflow mode is `ASPIRE_EXTENSION_E2E_RECORDING_MODE=always`, which keeps and uploads `extension/.test-recordings/<shard>/*.mp4` for both successful and failing Linux shards. Set `ASPIRE_EXTENSION_E2E_RECORDING_MODE=failure` when you only want failed-run videos, or `off` to disable recording. The default capture size is `1280x1024`, matching the hosted Xvfb display; override with `ASPIRE_EXTENSION_E2E_RECORDING_SIZE` if you run under a larger display. Recording is intentionally Linux-only because the Windows E2E jobs do not run under Xvfb and hosted desktop capture is less reliable.
 
 E2E tests should avoid fixed sleeps for readiness. Prefer the observation state written by the extension test bridge, ExTester wait APIs, unique generated workspaces, explicit per-phase timeouts, and cleanup through `aspire stop --apphost`. This is intentionally stricter than a normal smoke test because the suite runs a real VS Code, CLI, AppHost, terminal, and dashboard path. See https://github.com/microsoft/aspire/issues/17727 for the original tracking issue.
+
+Language-model tool tests must assert the bridge's `invocation` field before counting a call as public API coverage. `vscode.lm.invokeTool` identifies the public API; `registeredToolDirect` and `registeredToolCanceled` identify direct adapter calls that bypass it. The lifecycle suite also injects a real compiler error and checks that `aspire_explain_launch_failure` reports it after CLI-initiated shutdown.
 
 ## Localizing user-facing strings
 

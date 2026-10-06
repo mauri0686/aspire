@@ -134,6 +134,10 @@ internal static class CliTestHelper
         services.AddSingleton(sp => sp.GetRequiredService<ConsoleEnvironment>().Out);
         services.AddSingleton(options.TimeProvider);
         services.AddSingleton(options.TelemetryFactory);
+        services.AddSingleton(new TelemetryConfiguration { ReportedTelemetryEnabled = false });
+        services.AddSingleton<TelemetryTagsSource>();
+        services.AddSingleton<TelemetryManager>();
+        services.AddSingleton<AgentTelemetryHook>();
         services.AddSingleton<ProfilingTelemetry>();
         services.AddSingleton(options.ProjectLocatorFactory);
         services.AddSingleton(options.SolutionLocatorFactory);
@@ -195,6 +199,8 @@ internal static class CliTestHelper
         services.AddSingleton(options.LayoutDiscoveryFactory);
         services.AddTransient<LayoutProcessRunner>();
         services.AddTransient<ProcessTreeGracefulShutdownService>();
+        services.AddSingleton<IProcessIdentityProvider, ProcessIdentityProvider>();
+        services.AddSingleton(sp => new TrayProtocolOutput(() => sp.GetRequiredService<ConsoleEnvironment>().Out.Profile.Out.Writer));
         // Mirror Program.cs so consumers (e.g. GuestAppHostProject) that depend on the
         // interface receive the same ProcessTreeGracefulShutdownService instance the abstraction
         // wraps. Without this, DI returns null and Run-path tests construct the project with
@@ -263,6 +269,7 @@ internal static class CliTestHelper
 
         services.AddSingleton<CommonCommandServices>();
         services.AddSingleton<ResourceWaitService>();
+        services.AddSingleton<AppHostConfigurationProjector>();
         services.AddTransient<AppHostConnectionResolver>();
         services.AddTransient<RootCommand>();
         services.AddTransient<NewCommand>();
@@ -301,6 +308,10 @@ internal static class CliTestHelper
         services.AddTransient<DoctorCommand>();
         services.AddTransient<DashboardCommand>();
         services.AddTransient<DashboardRunCommand>();
+        services.AddTransient<TrayCommand>();
+        services.AddTransient<TrayStartCommand>();
+        services.AddTransient<TrayStopCommand>();
+        services.AddTransient<TrayLifecycleService>();
         services.AddTransient<UpdateCommand>();
         services.AddTransient<SetupCommand>();
         services.AddTransient<McpCommand>();
@@ -394,7 +405,7 @@ internal sealed class CliServiceCollectionTestOptions
         var outConsole = CreateAnsiConsole(outputTextWriter, !DisableAnsi);
         var errorConsole = CreateAnsiConsole(errorTextWriter, !DisableAnsi);
 
-        return new ConsoleEnvironment(outConsole, errorConsole);
+        return new ConsoleEnvironment(outConsole, errorConsole, TextReader.Null);
     };
 
     private static IAnsiConsole CreateAnsiConsole(TextWriter textWriter, bool ansi = true)
@@ -863,6 +874,14 @@ internal sealed class TestBundleService(bool isBundle) : IBundleService
 
     public Func<CancellationToken, Task>? EnsureExtractedAndAcquireLayoutAsyncCallback { get; set; }
 
+    public Func<BundleLayoutLease>? CreateLayoutLease { get; set; }
+
+    public int AcquireLayoutCallCount { get; private set; }
+
+    public string? LastHolderKind { get; private set; }
+
+    public string? LastCommandName { get; private set; }
+
     public Task EnsureExtractedAsync(CancellationToken cancellationToken = default)
         => EnsureExtractedAsyncCallback?.Invoke(cancellationToken) ?? Task.CompletedTask;
 
@@ -871,6 +890,9 @@ internal sealed class TestBundleService(bool isBundle) : IBundleService
 
     public async Task<BundleLayoutLease?> EnsureExtractedAndAcquireLayoutAsync(string holderKind, string? commandName = null, CancellationToken cancellationToken = default)
     {
+        AcquireLayoutCallCount++;
+        LastHolderKind = holderKind;
+        LastCommandName = commandName;
         if (EnsureExtractedException is not null)
         {
             throw EnsureExtractedException;
@@ -881,7 +903,7 @@ internal sealed class TestBundleService(bool isBundle) : IBundleService
             await EnsureExtractedAndAcquireLayoutAsyncCallback(cancellationToken);
         }
 
-        return Layout is null ? null : new BundleLayoutLease(Layout, lease: null);
+        return CreateLayoutLease?.Invoke() ?? (Layout is null ? null : new BundleLayoutLease(Layout, lease: null));
     }
 
     public string? GetDefaultExtractDir(string processPath) => null;
@@ -918,6 +940,13 @@ internal sealed class TestOutputTextWriter : TextWriter
     {
         _buffer.Append(message);
         FlushLine();
+    }
+
+    public override Task WriteLineAsync(ReadOnlyMemory<char> buffer, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        WriteLine(buffer.ToString());
+        return Task.CompletedTask;
     }
 
     public override void Write(string? message)

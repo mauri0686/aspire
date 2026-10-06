@@ -362,8 +362,8 @@ public class Program
         // the whole signal manager.
         builder.Services.AddSingleton<IGracefulShutdownWindow>(sp => sp.GetRequiredService<ConsoleCancellationManager>());
 
-        // Configure OpenTelemetry tracing. TelemetryManager reads configuration and creates
-        // separate TracerProvider instances:
+        // Configure OpenTelemetry tracing. TelemetryManager creates separate TracerProvider
+        // instances on Initialize(), after command selection:
         // - Azure Monitor provider with filtering (only exports activities with EXTERNAL_TELEMETRY=true)
         // - Profiling provider for explicit startup profiling OTLP export
         // - Diagnostic provider for DEBUG-only diagnostics
@@ -438,7 +438,8 @@ public class Program
         });
         builder.Services.AddSingleton(s => new ConsoleEnvironment(
             BuildAnsiConsole(s, Console.Out),
-            BuildAnsiConsole(s, Console.Error)));
+            BuildAnsiConsole(s, Console.Error),
+            Console.In));
         builder.Services.AddSingleton(s => s.GetRequiredService<ConsoleEnvironment>().Out);
         builder.Services.AddSingleton<ICliHostEnvironment>(provider =>
         {
@@ -468,14 +469,15 @@ public class Program
         builder.Services.AddSingleton<IFeatures, Features>();
         builder.Services.AddTelemetryServices();
         builder.Services.AddTransient<IProcessExecutionFactory, ProcessExecutionFactory>();
-        // Windows-only crash-time safety net for interactive children spawned by
-        // IsolatedProcess is provided by WindowsConsoleProcessJob.Shared — a process-wide
-        // job created on first isolated spawn. The OS closes the job handle automatically on
-        // process exit, firing KILL_ON_JOB_CLOSE on any assigned children that haven't already
-        // exited (e.g. orphaned tsx after the CLI crashes). On non-Windows, process-group
-        // reparenting + ordinary signal delivery cover the same case, so nothing is needed.
+        // Windows-only crash-time safety net for interactive children spawned by ProcessExecution
+        // is ProcessStartInfo.KillOnParentExit: the runtime assigns them to a kill-on-close job that
+        // the OS closes on process exit, terminating children that haven't already exited (e.g.
+        // orphaned tsx after the CLI crashes). On non-Windows, process-group reparenting + ordinary
+        // signal delivery cover the same case, so nothing is needed.
         builder.Services.AddTransient<LayoutProcessRunner>();
         builder.Services.AddTransient<ProcessTreeGracefulShutdownService>();
+        builder.Services.AddSingleton<IProcessIdentityProvider, ProcessIdentityProvider>();
+        builder.Services.AddSingleton(_ => TrayProtocolOutput.CreateStandardOutput());
         // Forward the interface to the existing concrete service so consumers can depend on the
         // abstraction (used by AppHostServerSession + GuestLaunchOptions in the aspire run path).
         builder.Services.AddTransient<IProcessTreeGracefulShutdownSignaler>(sp => sp.GetRequiredService<ProcessTreeGracefulShutdownService>());
@@ -529,6 +531,7 @@ public class Program
         builder.Services.AddSingleton<IPackagingService, PackagingService>();
         builder.Services.AddSingleton<IBundlePayloadProvider, EmbeddedBundlePayloadProvider>();
         builder.Services.AddSingleton<IInstallSidecarReader, InstallSidecarReader>();
+        builder.Services.AddSingleton<InstallSourceDetector>();
         builder.Services.AddSingleton<IPeerInstallProbe, PeerInstallProbe>();
         builder.Services.AddSingleton<IInstallationCandidateSource, PathInstallationCandidateSource>();
         builder.Services.AddSingleton<IInstallationCandidateSource, ReleasePrefixInstallationCandidateSource>();
@@ -638,6 +641,7 @@ public class Program
         // Commands.
         builder.Services.AddSingleton<CommonCommandServices>();
         builder.Services.AddSingleton<ResourceWaitService>();
+        builder.Services.AddSingleton<AppHostConfigurationProjector>();
         builder.Services.AddTransient<AppHostLauncher>();
         builder.Services.AddTransient<DcpWorkloadCleanupService>();
         builder.Services.AddTransient<NewCommand>();
@@ -672,6 +676,10 @@ public class Program
         builder.Services.AddTransient<DoctorCommand>();
         builder.Services.AddTransient<DashboardCommand>();
         builder.Services.AddTransient<DashboardRunCommand>();
+        builder.Services.AddTransient<TrayCommand>();
+        builder.Services.AddTransient<TrayStartCommand>();
+        builder.Services.AddTransient<TrayStopCommand>();
+        builder.Services.AddTransient<TrayLifecycleService>();
         builder.Services.AddTransient<UpdateCommand>();
         builder.Services.AddTransient<DeployCommand>();
         builder.Services.AddTransient<DestroyCommand>();
@@ -685,6 +693,7 @@ public class Program
         builder.Services.AddTransient<AgentMcpCommand>();
         builder.Services.AddTransient<AgentInitCommand>();
         builder.Services.AddTransient<AgentTelemetryCommand>();
+        builder.Services.AddSingleton<Agents.Hooks.AgentTelemetryHook>();
         builder.Services.AddTransient<TelemetryCommand>();
         builder.Services.AddTransient<TelemetryLogsCommand>();
         builder.Services.AddTransient<TelemetrySpansCommand>();
@@ -855,7 +864,7 @@ public class Program
         // Show banner if explicitly requested OR on first run (unless suppressed by noLogo).
         // Always require interactive output support — the animated banner uses Spectre.Console's Live display
         // which manipulates the cursor and fails when console handles are invalid (e.g., stdout is redirected).
-        if ((showBanner || (isFirstRun && !noLogo)) && hostEnvironment.SupportsInteractiveOutput)
+        if ((showBanner || (isFirstRun && !noLogo)) && hostEnvironment.SupportsInteractiveOutput && !HasProtocolOutput(args))
         {
             var bannerService = serviceProvider.GetRequiredService<IBannerService>();
             await bannerService.DisplayBannerAsync(cancellationToken);
@@ -937,6 +946,11 @@ public class Program
     // accidentally suppress the first-run experience.
     private static bool HasMachineReadableOutput(string[] args)
     {
+        if (HasProtocolOutput(args))
+        {
+            return true;
+        }
+
         if (IsLegacyExtensionGetAppHostsCommand(args))
         {
             return true;
@@ -950,7 +964,8 @@ public class Program
                 return false;
             }
 
-            if (arg.Equals("--format=json", StringComparison.OrdinalIgnoreCase))
+            if (arg.Equals("--format=json", StringComparison.OrdinalIgnoreCase) ||
+                arg.Equals("--format=mermaid", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -968,7 +983,29 @@ public class Program
 
             if (arg.Equals("--format", StringComparison.OrdinalIgnoreCase)
                 && i + 1 < args.Length
-                && args[i + 1].Equals("json", StringComparison.OrdinalIgnoreCase))
+                && (args[i + 1].Equals("json", StringComparison.OrdinalIgnoreCase) ||
+                    args[i + 1].Equals("mermaid", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasProtocolOutput(string[] args)
+    {
+        if (ContainsRootOption(args, arg => arg == "--protocol-version" || arg.StartsWith("--protocol-version=", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        var isPs = false;
+        for (var i = 0; i < args.Length && args[i] != "--"; i++)
+        {
+            isPs |= args[i] == "ps";
+            if (isPs && (args[i].Equals("--output=snapshot", StringComparison.OrdinalIgnoreCase)
+                || (args[i] == "--output" && i + 1 < args.Length && args[i + 1].Equals("snapshot", StringComparison.OrdinalIgnoreCase))))
             {
                 return true;
             }
@@ -1031,6 +1068,8 @@ public class Program
             return await InvokeCompletionAsync(args, Console.Out, Console.Error).ConfigureAwait(false);
         }
 
+        TelemetryManager.ConfigureExporterForProcess(AgentTelemetryInvocation.Matches(args));
+
         // Re-enable CTRL+C delivery for ourselves and any process we subsequently spawn.
         // Per https://learn.microsoft.com/windows/console/setconsolectrlhandler, the "ignore
         // CTRL+C" state is process-level and inherited across CreateProcess. If our parent was
@@ -1070,9 +1109,9 @@ public class Program
         // AddSingleton(instance) so the container does not take disposal ownership.
         using var cancellationManager = new ConsoleCancellationManager(finalDrainBudget: TimeSpan.FromSeconds(5));
 
-        // Parse this before building the host because TelemetryManager reads OTEL configuration
-        // during DI startup. Waiting for System.CommandLine binding would be too late: the CLI
-        // profiling ActivitySource would already have been configured without the private exporter.
+        // Parse this before building the host so TelemetryManager receives the profiling OTEL
+        // configuration when resolved from DI. Waiting for System.CommandLine binding would be
+        // too late: the CLI profiling ActivitySource would lack its private exporter.
         var profileCaptureOptions = ProfileCaptureOptions.TryCreate(args, TimeProvider.System, new DirectoryInfo(Environment.CurrentDirectory));
         using var profileCaptureEnvironment = profileCaptureOptions is not null
             ? ProfileCaptureEnvironment.Apply(profileCaptureOptions)
@@ -1106,14 +1145,14 @@ public class Program
 
         IHost? app = null;
         TelemetryManager telemetryManager;
+        ParseResult parseResult;
         try
         {
             app = await BuildApplicationAsync(args, startupContext);
-            // Create telemetry providers before hosted services start. AspireCliTelemetry starts
-            // background tag calculation as a hosted service and can complete a cache-hit detector
-            // immediately; resolving the manager first guarantees its listener is attached before
-            // the detector-health activity is created.
+            parseResult = app.Services.GetRequiredService<RootCommand>().Parse(args);
             telemetryManager = app.Services.GetRequiredService<TelemetryManager>();
+            InitializeCommandTelemetry(parseResult.CommandResult.Command, telemetryManager,
+                app.Services.GetRequiredService<AspireCliTelemetry>());
             await app.StartAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -1126,7 +1165,7 @@ public class Program
         }
 
         // Ensure dispose of app when Main exits.
-        using var _ = app;
+        using var appLifetime = app;
 
         // Immediately get telemetry so background tag calculation is available to command activities.
         var telemetry = app.Services.GetRequiredService<AspireCliTelemetry>();
@@ -1136,11 +1175,9 @@ public class Program
         // Log feature state at startup for diagnostics
         app.Services.GetRequiredService<IFeatures>().LogFeatureState();
 
-        // The agent telemetry command is invoked fire-and-forget by the agent telemetry hook
-        // scripts on every PostToolUse event. It emits its own dedicated reported span, so the
-        // generic aspire/cli/main span is suppressed below to avoid double-counting CLI usage, and
-        // the first-run telemetry notice is skipped so a background hook cannot silently consume the
-        // notice the user is meant to see on their first interactive command.
+        // The agent telemetry command emits its own dedicated reported span, so the generic
+        // aspire/cli/main span is suppressed below to avoid double-counting CLI usage. The first-run
+        // notice is skipped so a background hook cannot consume the interactive user's notice.
         var isAgentTelemetryInvocation = AgentTelemetryInvocation.Matches(args);
 
         // Display first run experience if this is the first time the CLI is run on this machine
@@ -1149,7 +1186,6 @@ public class Program
             await DisplayFirstTimeUseNoticeIfNeededAsync(app.Services, args, cancellationManager.Token);
         }
 
-        var rootCommand = app.Services.GetRequiredService<RootCommand>();
         var invokeConfig = new InvocationConfiguration()
         {
             // Disable default exception handler so we can log exceptions to telemetry.
@@ -1160,21 +1196,11 @@ public class Program
 
         app.Services.GetRequiredService<CliExecutionContext>();
 
-        // Suppress the generic main span for the agent telemetry command path: that command emits
-        // its own aspire/cli/agent_telemetry span, and creating the main span too would record a
-        // second span (inflating ordinary CLI-usage metrics) for every hook event.
+        // Agent events must not also count as ordinary CLI invocations.
         using var mainActivity = isAgentTelemetryInvocation
             ? null
-            : telemetry.StartReportedActivity(TelemetryConstants.Activities.Main, ActivityKind.Internal);
+            : StartMainActivity(telemetry, app.Services.GetRequiredService<InstallSourceDetector>());
         ProfileCaptureService.ProfileCaptureSession? profileCaptureSession = null;
-
-        if (mainActivity != null)
-        {
-            var currentProcess = Process.GetCurrentProcess();
-            mainActivity.SetStartTime(currentProcess.StartTime);
-            mainActivity.AddTag(TelemetryConstants.Tags.ProcessPid, currentProcess.Id);
-            mainActivity.AddTag(TelemetryConstants.Tags.ProcessExecutableName, "aspire");
-        }
 
         try
         {
@@ -1185,13 +1211,6 @@ public class Program
                 {
                     profileCaptureSession = await app.Services.GetRequiredService<ProfileCaptureService>().StartAsync(profileCaptureOptions, cancellationManager.Token).ConfigureAwait(false);
                 }
-
-                // Parse before logging. `aspire run --ApiKey sk-live-...` forwards unmatched tokens
-                // to the AppHost even though the user never typed a `--` separator, so the parse
-                // tree is the only reliable way to tell CLI-owned tokens from AppHost input.
-                // Reordering is safe because Parse collects errors into the result instead of
-                // throwing, and nothing between here and the original call site inspects args.
-                var parseResult = rootCommand.Parse(args);
 
                 // Log command invocation details for debugging. Anything forwarded to the AppHost
                 // can contain secrets, so it is redacted.
@@ -1265,6 +1284,7 @@ public class Program
             {
                 try
                 {
+                    telemetryManager.Initialize();
                     await telemetryManager.ForceFlushProfilingAsync().ConfigureAwait(false);
                     var exportExitCode = await profileCaptureSession.ExportAsync(cancellationManager.Token).ConfigureAwait(false);
                     if (exitCode == CliExitCodes.Success && exportExitCode != CliExitCodes.Success)
@@ -1292,34 +1312,43 @@ public class Program
                 await profileCaptureSession.DisposeAsync().ConfigureAwait(false);
             }
 
-            // The detector-health activity is created asynchronously after default tags resolve. Ensure
-            // it has been handed to the provider before shutdown starts so short CLI invocations do not
-            // lose the activity while the provider is flushing.
+            // Finish asynchronously-created detector activities before shutting down their provider.
             await telemetry.CompleteInternalMicrosoftDiagnosticsAsync().ConfigureAwait(false);
-
-            // The agent telemetry command runs fire-and-forget from an agent hook and the process
-            // exits immediately after. The short Release shutdown flush window is not enough to
-            // reliably export its just-created activity, so flush after telemetry tag calculation
-            // has completed and the agent activity has been submitted to the reported provider.
-            if (isAgentTelemetryInvocation)
-            {
-                try
-                {
-                    await telemetryManager.ForceFlushReportedAsync().ConfigureAwait(false);
-                }
-                catch
-                {
-                    // A telemetry flush failure must never change the hook's exit code.
-                }
-            }
 
             // Shutting down telemetry manager to flush any remaining telemetry will take time.
             // Run it concurrently with application shutdown after all asynchronously-created telemetry
             // has been submitted to the providers.
-            var shutdownTelemetryTask = telemetryManager.ShutdownAsync();
+            var shutdownTelemetryTask = telemetryManager.TryShutdownAsync();
 
             await app.StopAsync().ConfigureAwait(false);
             await shutdownTelemetryTask;
+        }
+    }
+
+    internal static Activity? StartMainActivity(AspireCliTelemetry telemetry, InstallSourceDetector installSourceDetector)
+    {
+        var activity = telemetry.StartReportedActivity(TelemetryConstants.Activities.Main, ActivityKind.Internal);
+        if (activity is not null)
+        {
+            using var currentProcess = Process.GetCurrentProcess();
+            activity.SetStartTime(currentProcess.StartTime);
+            activity.AddTag(TelemetryConstants.Tags.ProcessPid, currentProcess.Id);
+            activity.AddTag(TelemetryConstants.Tags.ProcessExecutableName, "aspire");
+            activity.SetTag(TelemetryConstants.Tags.InstallSource, installSourceDetector.Detect());
+        }
+
+        return activity;
+    }
+
+    internal static void InitializeCommandTelemetry(Command command, TelemetryManager manager, AspireCliTelemetry telemetry)
+    {
+        // Like package prefetching, expensive telemetry startup is command-controlled. A hook may
+        // have nothing to report; its handler opts in after classification, through normal dispatch.
+        if (command is not BaseCommand { InitializeTelemetryOnStartup: false })
+        {
+            // Attach listeners before enrichment can emit immediately completed activities.
+            manager.Initialize();
+            telemetry.Initialize();
         }
     }
 
